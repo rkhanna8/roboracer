@@ -60,8 +60,6 @@ class Adapter(Node):
         qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
                          history=HistoryPolicy.KEEP_LAST, depth=1)
 
-        self.create_subscription(Point, self.ns + '/ips', self.ips_cb, qos)
-        self.create_subscription(Odometry, self.ns + '/odom', self.sim_odom_cb, qos)
         self.create_subscription(Imu, self.ns + '/imu', self.imu_cb, qos)
         self.create_subscription(LaserScan, self.ns + '/lidar', self.lidar_cb, qos)
         self.create_subscription(Odometry, self.odom_topic, self.odom_cb, 10)
@@ -169,7 +167,8 @@ class Adapter(Node):
 
     def lidar_cb(self, msg:LaserScan):
         msg.header.frame_id = 'laser'
-        msg.header.stamp = self.get_clock().now().to_msg()
+        # Diagnostic: treat the simulated scan as a single snapshot.
+        msg.time_increment = 0.0
         self.scan_pub.publish(msg)
 
     # ---------------- stack -> AutoDRIVE ----------------

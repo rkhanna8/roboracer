@@ -31,5 +31,4 @@ def generate_launch_description():
                      '". When done: ros2 run perception save_map ', LaunchConfiguration('track')]),
         cartographer,
         grid,
-        map_origin,
     ])

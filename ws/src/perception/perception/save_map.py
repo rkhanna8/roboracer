@@ -40,8 +40,7 @@ class SaveMap(Node):
         # volatile + reliable matches cartographer_occupancy_grid_node whatever its durability
         self.create_subscription(OccupancyGrid, '/map', self.map_cb,
                                  QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE))
-        self.create_subscription(PoseStamped, '/map_origin/ground_truth', self.origin_cb,
-                                 QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL))
+
 
     def map_cb(self, msg):
         self.map = msg

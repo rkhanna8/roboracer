@@ -1,131 +1,98 @@
-#!/usr/bin/env python3
-"""Wheel odometry from the AutoDRIVE rear-wheel encoders (simulation only).
+"""Sensor-derived forward velocity for the RoboRacer AutoDRIVE simulator.
 
-Sim stand-in for f1tenth_system's vesc_to_odom: publishes /odom (odom -> base_link) with the
-same kinematic bicycle model, so everything downstream is identical on the real car, where
-vesc_to_odom publishes /odom from the VESC instead and this node is not launched.
-
-  distance = mean rear-wheel angle change * wheel_radius   (integrated each frame, exact)
-  speed    = distance over the last speed_window seconds  (sim frames arrive unevenly, so
-             a single-frame difference is noisy)
-  yaw rate = IMU gyro z (use_imu_yaw_rate, default), or the bicycle model
-             speed * tan(steering angle) / wheelbase, which reads only ~55% of the sim's real
-             turn rate (measured on Porto) and made Cartographer drift in hairpins
-
-Subscribed (vehicle_ns = /autodrive/roboracer_1):
-  left_encoder, right_encoder (JointState, cumulative wheel angle in rad), steering (Float32, -1..1),
-  imu (Imu)
+Adapted from the user's previous synchronized encoder odometry. No simulator
+position/velocity or differential-drive yaw is used.
 """
 import math
-from collections import deque
 
+import message_filters
 import rclpy
-from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from geometry_msgs.msg import TransformStamped
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu, JointState
-from std_msgs.msg import Float32
-from tf2_ros import TransformBroadcaster
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
 
 
-class WheelOdom(Node):
+class WheelOdometry(Node):
     def __init__(self):
-        super().__init__('wheel_odom')
-        p = self.declare_parameter
-        ns = p('vehicle_ns', '/autodrive/roboracer_1').value
-        self.wheel_radius = p('wheel_radius', 0.0585).value      # m; calibrated against /ground_truth/odom
-        self.speed_window = p('speed_window', 0.1).value         # s
-        self.wheelbase = p('wheelbase', 0.33).value              # m, rear axle -> front axle
-        self.max_steer = p('max_steering_angle', 0.5236).value   # rad at steering = 1
-        self.publish_tf = p('publish_tf', True).value            # TF odom -> base_link
-        self.use_imu = p('use_imu_yaw_rate', True).value          # gyro yaw rate instead of the bicycle model
+        super().__init__('autodrive_wheel_odometry')
+        self.declare_parameter('meters_per_encoder_unit', 0.0589022388631801)
+        self.scale = float(self.get_parameter('meters_per_encoder_unit').value)
+        if not math.isfinite(self.scale) or self.scale <= 0:
+            raise ValueError('Invalid encoder calibration')
 
-        # AutoDRIVE's bridge publishes RELIABLE / depth 1; match it.
-        qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE,
-                         history=HistoryPolicy.KEEP_LAST, depth=1)
-        self.create_subscription(JointState, ns + '/left_encoder', self.left_cb, qos)
-        self.create_subscription(JointState, ns + '/right_encoder', self.right_cb, qos)
-        self.create_subscription(Float32, ns + '/steering', self.steering_cb, qos)
-        self.create_subscription(Imu, ns + '/imu', self.imu_cb, qos)
+        self.previous = None
+        self.publisher = self.create_publisher(Odometry, '/wheel/odom', 10)
+        ns = '/autodrive/roboracer_1'
+        self.left = message_filters.Subscriber(self, JointState, ns + '/left_encoder')
+        self.right = message_filters.Subscriber(self, JointState, ns + '/right_encoder')
+        self.synchronizer = message_filters.ApproximateTimeSynchronizer(
+            [self.left, self.right], queue_size=20, slop=0.02
+        )
+        self.synchronizer.registerCallback(self.update)
+        self.get_logger().info(
+            f'Waiting for synchronized wheel encoders; scale={self.scale:.8f} m/unit.'
+        )
 
-        self.odom_pub = self.create_publisher(Odometry, '/odom', 10)
-        self.tf = TransformBroadcaster(self)
-
-        self.left = None
-        self.last = None              # (t, left angle, right angle)
-        self.history = deque()        # (t, distance travelled)
-        self.dist = 0.0
-        self.steer = 0.0
-        self.gyro_z = None
-        self.x = self.y = self.yaw = 0.0
-
-    def steering_cb(self, msg):
-        self.steer = float(msg.data) * self.max_steer
-
-    def imu_cb(self, msg):
-        self.gyro_z = msg.angular_velocity.z
-
-    def left_cb(self, msg):
-        self.left = msg.position[0]
-
-    # fast_bridge publishes left then right in the same frame, so the right encoder closes a sample
-    def right_cb(self, msg):
-        if self.left is None:
+    def update(self, left, right):
+        if not left.position or not right.position:
             return
-        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-        sample = (t, self.left, msg.position[0])
-        last, self.last = self.last, sample
-        if last is None or t <= last[0]:
+        le, re = float(left.position[0]), float(right.position[0])
+        if not (math.isfinite(le) and math.isfinite(re)):
             return
 
-        ds = 0.5 * ((sample[1] - last[1]) + (sample[2] - last[2])) * self.wheel_radius
-        curvature = math.tan(self.steer) / self.wheelbase
-        gyro = self.use_imu and self.gyro_z is not None
-        dyaw = self.gyro_z * (t - last[0]) if gyro else ds * curvature
-        self.x += ds * math.cos(self.yaw + 0.5 * dyaw)
-        self.y += ds * math.sin(self.yaw + 0.5 * dyaw)
-        self.yaw += dyaw
-        self.dist += ds
+        left_ns = left.header.stamp.sec * 10**9 + left.header.stamp.nanosec
+        right_ns = right.header.stamp.sec * 10**9 + right.header.stamp.nanosec
+        stamp_ns = max(left_ns, right_ns)
+        current = (stamp_ns, le, re)
+        if self.previous is None:
+            self.previous = current
+            self.get_logger().info('Encoder baseline received.')
+            return
 
-        self.history.append((t, self.dist))
-        while len(self.history) > 2 and t - self.history[1][0] >= self.speed_window:
-            self.history.popleft()
-        t0, d0 = self.history[0]
-        speed = (self.dist - d0) / (t - t0) if t > t0 else 0.0
-        yaw_rate = self.gyro_z if gyro else speed * curvature
-        qz, qw = math.sin(self.yaw / 2.0), math.cos(self.yaw / 2.0)
+        prev_ns, prev_le, prev_re = self.previous
+        dt = (stamp_ns - prev_ns) / 1e9
+        if dt <= 0:
+            return
+        self.previous = current
+        if dt > 1.0:
+            self.get_logger().warning('Encoder gap: rebasing.')
+            return
 
-        odom = Odometry()
-        odom.header.stamp = msg.header.stamp
-        odom.header.frame_id = 'odom'
-        odom.child_frame_id = 'base_link'
-        odom.pose.pose.position.x = self.x
-        odom.pose.pose.position.y = self.y
-        odom.pose.pose.orientation.z = qz
-        odom.pose.pose.orientation.w = qw
-        odom.twist.twist.linear.x = speed
-        odom.twist.twist.angular.z = yaw_rate
-        self.odom_pub.publish(odom)
+        dl, dr = (le - prev_le) * self.scale, (re - prev_re) * self.scale
+        if max(abs(dl), abs(dr)) > 25.0 * dt + 0.05:
+            self.get_logger().warning('Encoder jump: sample skipped.')
+            return
 
-        if self.publish_tf:
-            tf = TransformStamped()
-            tf.header = odom.header
-            tf.child_frame_id = 'base_link'
-            tf.transform.translation.x = self.x
-            tf.transform.translation.y = self.y
-            tf.transform.rotation.z = qz
-            tf.transform.rotation.w = qw
-            self.tf.sendTransform(tf)
+        v = (dl + dr) / (2.0 * dt)
+        if not math.isfinite(v):
+            return
+
+        msg = Odometry()
+        msg.header.stamp.sec = stamp_ns // 10**9
+        msg.header.stamp.nanosec = stamp_ns % 10**9
+        msg.header.frame_id = 'odom'
+        msg.child_frame_id = 'base_link'
+        msg.pose.pose.orientation.w = 1.0
+        msg.twist.twist.linear.x = v
+        # Only linear.x is measured. EKF must fuse *only* this field.
+        for i in range(6):
+            msg.pose.covariance[7 * i] = 1e6
+            msg.twist.covariance[7 * i] = 1e6
+        msg.twist.covariance[0] = 0.04  # Provisional variance (m/s)^2.
+        self.publisher.publish(msg)
 
 
-def main():
-    rclpy.init()
-    node = WheelOdom()
+def main(args=None):
+    rclpy.init(args=args)
+    node = WheelOdometry()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
         node.destroy_node()
-        rclpy.try_shutdown()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

@@ -33,6 +33,5 @@ def generate_launch_description():
         DeclareLaunchArgument('publish_camera',default_value='true'),
         bridge,
         adapter,
-        wheel_odom,
         foxglove,        
     ])
