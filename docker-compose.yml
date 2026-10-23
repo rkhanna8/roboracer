@@ -8,7 +8,11 @@ services:
     ports:
       - "4567:4567"   # AutoDRIVE bridge
       - "8765:8765"   # Foxglove
+    environment:
+      - DISPLAY=host.docker.internal:0
+      - QT_X11_NO_MITSHM=1
     volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - ./ws:/root/ws
       - ./.bash_aliases:/root/.bash_aliases:ro
     working_dir: /root/ws
